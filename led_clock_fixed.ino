@@ -4,6 +4,8 @@
 #include <EEPROM.h>
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
+#include <WiFiClient.h>
+#include <ESP8266TelnetServer.h>
 
 // ================= VERSION =================
 const char* FIRMWARE_VERSION = "2.0.0";
@@ -60,7 +62,14 @@ const char* LANG_RU[] = {
   "Слабый сигнал Wi-Fi",
   "Не удалось подключиться к Wi-Fi",
   "NTP сервер недоступен",
-  "Используется резервный NTP сервер"
+  "\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0435\u0442\u0441\u044f \u0440\u0435\u0437\u0435\u0440\u0432\u043d\u044b\u0439 NTP \u0441\u0435\u0440\u0432\u0435\u0440",
+  "Telnet \u0441\u0435\u0440\u0432\u0435\u0440",
+  "Telnet \u0432\u043a\u043b\u044e\u0447\u0435\u043d \u043d\u0430 \u043f\u043e\u0440\u0442\u0443 23",
+  "Telnet \u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d",
+  "\u0412\u043a\u043b\u044e\u0447\u0438\u0442\u044c Telnet",
+  "\u041e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c Telnet",
+  "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e \u0447\u0435\u0440\u0435\u0437 Telnet",
+  "Telnet \u043e\u0442\u0441\u043e\u0435\u0434\u0438\u043d\u0435\u043d\u043e"
 };
 
 const char* LANG_EN[] = {
@@ -110,7 +119,14 @@ const char* LANG_EN[] = {
   "Weak Wi-Fi Signal",
   "Failed to connect to Wi-Fi",
   "NTP server unavailable",
-  "Using fallback NTP server"
+  "Using fallback NTP server",
+  "Telnet Server",
+  "Telnet enabled on port 23",
+  "Telnet disabled",
+  "Enable Telnet",
+  "Disable Telnet",
+  "Connected via Telnet",
+  "Telnet disconnected"
 };
 
 const char** getLangStrings() {
@@ -120,6 +136,16 @@ const char** getLangStrings() {
 // ================= LOGGING =================
 #define LOG_BUFFER_SIZE 2048
 char logBuffer[LOG_BUFFER_SIZE] = "";
+
+// ================= TELNET SERVER =================
+ESP8266TelnetServer telnetServer(23);
+bool telnetEnabled = false;
+bool telnetConnected = false;
+
+// Telnet clients
+WiFiClient telnetClients[4];
+int telnetClientCount = 0;
+const int MAX_TELNET_CLIENTS = 4;
 
 void logMessage(const char* message, bool isError = false) {
   static unsigned long lastLogTime = 0;
@@ -163,6 +189,225 @@ String getLogs() {
 void clearLogs() {
   logBuffer[0] = '\0';
   logMessage("Logs cleared");
+}
+
+// ================= TELNET FUNCTIONS =================
+void setupTelnet() {
+  if (telnetEnabled) {
+    telnetServer.begin();
+    telnetServer.setNoDelay(true);
+    logMessage("Telnet server started on port 23");
+  } else {
+    telnetServer.close();
+    logMessage("Telnet server stopped");
+  }
+}
+
+void enableTelnet() {
+  telnetEnabled = true;
+  setupTelnet();
+}
+
+void disableTelnet() {
+  telnetEnabled = false;
+  // Close all existing connections
+  for (int i = 0; i < telnetClientCount; i++) {
+    telnetClients[i].stop();
+  }
+  telnetClientCount = 0;
+  telnetConnected = false;
+  setupTelnet();
+}
+
+void handleTelnetClients() {
+  if (!telnetEnabled) return;
+
+  // Check for new connections
+  if (telnetServer.hasClient()) {
+    if (telnetClientCount < MAX_TELNET_CLIENTS) {
+      telnetClients[telnetClientCount] = telnetServer.available();
+      telnetClients[telnetClientCount].flush();
+      telnetClients[telnetClientCount].println(getLangText(40)); // Connected via Telnet
+      telnetClients[telnetClientCount].println("Type 'help' for available commands.");
+      telnetClientCount++;
+      telnetConnected = true;
+      logMessage("New Telnet connection. Total clients: " + String(telnetClientCount));
+    } else {
+      WiFiClient client = telnetServer.available();
+      client.println("Server busy. Try again later.");
+      client.stop();
+    }
+  }
+
+  // Check existing clients
+  for (int i = 0; i < telnetClientCount; i++) {
+    if (telnetClients[i].connected()) {
+      // Process incoming commands
+      if (telnetClients[i].available()) {
+        String command = telnetClients[i].readStringUntil('\n');
+        command.trim();
+        if (command.length() > 0) {
+          processTelnetCommand(telnetClients[i], command);
+        }
+      }
+    } else {
+      telnetClients[i].stop();
+      // Shift remaining clients
+      for (int j = i; j < telnetClientCount - 1; j++) {
+        telnetClients[j] = telnetClients[j + 1];
+      }
+      telnetClientCount--;
+      if (telnetClientCount == 0) {
+        telnetConnected = false;
+      }
+      logMessage("Telnet client disconnected. Remaining: " + String(telnetClientCount));
+    }
+  }
+}
+
+void processTelnetCommand(WiFiClient& client, String command) {
+  const char** lang = getLangStrings();
+  
+  if (command.equalsIgnoreCase("help") || command.equalsIgnoreCase("?")) {
+    client.println("Available commands:");
+    client.println("  time      - Show current time");
+    client.println("  date      - Show current date");
+    client.println("  wifi      - Show Wi-Fi status");
+    client.println("  ip        - Show IP address");
+    client.println("  ntp       - Show NTP status");
+    client.println("  brightness - Show/get brightness");
+    client.println("  brightness X - Set brightness (0-100)");
+    client.println("  night on|off - Toggle night mode");
+    client.println("  blink on|off - Toggle blink dots");
+    client.println("  tz UTC+X  - Set timezone (e.g., UTC+3)");
+    client.println("  logs      - Show recent logs");
+    client.println("  clear     - Clear logs");
+    client.println("  restart   - Restart device");
+    client.println("  version   - Show firmware version");
+    client.println("  help      - Show this help");
+  }
+  else if (command.equalsIgnoreCase("time")) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char timeStr[20];
+      strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+      client.println("Current time: " + String(timeStr));
+    } else {
+      client.println("Time not synchronized");
+    }
+  }
+  else if (command.equalsIgnoreCase("date")) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char dateStr[20];
+      strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
+      client.println("Current date: " + String(dateStr));
+    } else {
+      client.println("Date not available");
+    }
+  }
+  else if (command.equalsIgnoreCase("wifi")) {
+    client.println("Wi-Fi Status:");
+    client.println("  Connected: " + String(WiFi.status() == WL_CONNECTED ? "Yes" : "No"));
+    client.println("  SSID: " + String(WiFi.SSID()));
+    client.println("  IP: " + WiFi.localIP().toString());
+    client.println("  Signal: " + String(WiFi.RSSI()) + " dBm");
+  }
+  else if (command.equalsIgnoreCase("ip")) {
+    if (WiFi.status() == WL_CONNECTED) {
+      client.println("IP Address: " + WiFi.localIP().toString());
+    } else if (apActive) {
+      client.println("AP IP Address: " + WiFi.softAPIP().toString());
+    } else {
+      client.println("Not connected");
+    }
+  }
+  else if (command.equalsIgnoreCase("ntp")) {
+    client.println("NTP Status:");
+    client.println("  Synced: " + String(ntpSynced ? "Yes" : "No"));
+    client.println("  Current server: " + String(ntpServers[currentNtpServerIndex]));
+    client.println("  Timezone offset: " + String(gmtOffsetSec / 3600) + " hours");
+  }
+  else if (command.equalsIgnoreCase("brightness")) {
+    client.println("Current brightness: " + String(brightness) + "%");
+  }
+  else if (command.startsWith("brightness ")) {
+    int newBrightness = command.substring(11).toInt();
+    if (newBrightness >= 0 && newBrightness <= 100) {
+      brightness = newBrightness;
+      config.brightness = brightness;
+      saveConfig();
+      client.println("Brightness set to: " + String(brightness) + "%");
+    } else {
+      client.println("Invalid brightness value (0-100)");
+    }
+  }
+  else if (command.equalsIgnoreCase("night on")) {
+    nightMode = true;
+    config.nightMode = true;
+    saveConfig();
+    client.println("Night mode: ON");
+  }
+  else if (command.equalsIgnoreCase("night off")) {
+    nightMode = false;
+    config.nightMode = false;
+    saveConfig();
+    client.println("Night mode: OFF");
+  }
+  else if (command.equalsIgnoreCase("night")) {
+    client.println("Night mode: " + String(nightMode ? "ON" : "OFF"));
+  }
+  else if (command.equalsIgnoreCase("blink on")) {
+    blinkDots = true;
+    config.blinkDots = true;
+    saveConfig();
+    client.println("Blink dots: ON");
+  }
+  else if (command.equalsIgnoreCase("blink off")) {
+    blinkDots = false;
+    config.blinkDots = false;
+    saveConfig();
+    client.println("Blink dots: OFF");
+  }
+  else if (command.equalsIgnoreCase("blink")) {
+    client.println("Blink dots: " + String(blinkDots ? "ON" : "OFF"));
+  }
+  else if (command.startsWith("tz ")) {
+    String tzStr = command.substring(3);
+    if (tzStr.startsWith("UTC") || tzStr.startsWith("utc")) {
+      int offset = tzStr.substring(3).toInt();
+      if (offset >= -12 && offset <= 14) {
+        gmtOffsetSec = offset * 3600;
+        config.gmtOffsetSec = gmtOffsetSec;
+        configTime(gmtOffsetSec, daylightOffset_sec, ntpServers[currentNtpServerIndex]);
+        saveConfig();
+        client.println("Timezone set to: UTC" + String(offset >= 0 ? "+" : "") + String(offset));
+      } else {
+        client.println("Invalid timezone offset (-12 to +14)");
+      }
+    } else {
+      client.println("Usage: tz UTC+X (e.g., UTC+3)");
+    }
+  }
+  else if (command.equalsIgnoreCase("logs")) {
+    client.println("=== Recent Logs ===");
+    client.println(getLogs());
+  }
+  else if (command.equalsIgnoreCase("clear")) {
+    clearLogs();
+    client.println("Logs cleared");
+  }
+  else if (command.equalsIgnoreCase("restart")) {
+    client.println("Restarting device...");
+    logMessage("Device restart requested via Telnet");
+    scheduleRestart(1000);
+  }
+  else if (command.equalsIgnoreCase("version")) {
+    client.println("Firmware version: " + String(FIRMWARE_VERSION));
+  }
+  else {
+    client.println("Unknown command. Type 'help' for available commands.");
+  }
 }
 
 // ================= AP CONFIG =================
@@ -656,6 +901,7 @@ String generateHtmlPage() {
   html += getLangText(6); // Wi-Fi Setup
   html += R"rawliteral(</button>
     <button class="tab-button" onclick="showTab('ota')">OTA</button>
+    <button class="tab-button" onclick="showTab('telnet')">Telnet</button>
     <button class="tab-button" onclick="showTab('logs')">)rawliteral";
   html += getLangText(25); // Logs
   html += R"rawliteral(</button>
@@ -764,6 +1010,32 @@ String generateHtmlPage() {
       <p class="status">Current version: )rawliteral";
   html += String(FIRMWARE_VERSION);
   html += R"rawliteral(</p>
+    </div>
+  </div>
+
+  <!-- Telnet Tab -->
+  <div id="telnet" class="tab">
+    <div class="card">
+      <h3>)rawliteral";
+  html += getLangText(38); // Telnet Server
+  html += R"rawliteral(</h3>
+      <p class="info">Status: <span id="telnetStatus">)rawliteral";
+  html += (telnetEnabled ? getLangText(41) : getLangText(42));
+  html += R"rawliteral(</span></p>
+      <p class="info">Port: 23</p>
+      <p class="status">Connect using: telnet )rawliteral";
+  html += (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "192.168.4.1");
+  html += R"rawliteral( or LED-Clock-[CHIPID].local</p>
+      <p class="status">Available commands: time, date, wifi, ip, ntp, brightness, night, blink, tz, logs, clear, restart, version, help</p>
+      <label class="switch">
+        <input type="checkbox" id="telnetToggle" )rawliteral";
+  html += (telnetEnabled ? "checked" : "");
+  html += R"rawliteral( onchange="toggleTelnet(this.checked)">
+        <span class="slider"></span>
+      </label>
+      <p style="margin-top: 10px;">)rawliteral";
+  html += getLangText(43); // Enable Telnet
+  html += R"rawliteral(/Disable Telnet)</p>
     </div>
   </div>
 
@@ -892,6 +1164,8 @@ String generateHtmlPage() {
         document.getElementById('brightness').value = data.brightness;
         updateBrightnessValue(data.brightness);
         document.getElementById('otaHostname').innerText = data.hostname;
+        document.getElementById('telnetStatus').innerText = data.telnetEnabled ? lang.ok : lang.error;
+        document.getElementById('telnetToggle').checked = data.telnetEnabled;
       });
 
     function toggleSetting(type, value) {
@@ -973,6 +1247,15 @@ String generateHtmlPage() {
             document.getElementById('resetStatus').className = 'status success';
           });
       }
+    }
+
+    function toggleTelnet(enabled) {
+      fetch('/telnet?enable=' + (enabled ? '1' : '0'))
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('telnetStatus').innerText = enabled ? lang.ok : lang.error;
+          console.log(text);
+        });
     }
 
     function refreshLogs() {
@@ -1137,7 +1420,8 @@ void handleStatus() {
                 ",\"brightness\":" + String(brightness) +
                 ",\"hostname\":\"" + hostname + "\"" +
                 ",\"ntpSynced\":" + String(ntpSynced ? "true" : "false") +
-                ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"}";
+                ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"" +
+                ",\"telnetEnabled\":" + String(telnetEnabled ? "true" : "false") + "}";
   server.send(200, "application/json", json);
 }
 
@@ -1216,6 +1500,25 @@ void handleSetAPPassword() {
   }
 }
 
+void handleTelnetToggle() {
+  touchAP();
+  if (server.hasArg("enable")) {
+    String enableStr = server.arg("enable");
+    if (enableStr == "1" || enableStr == "true") {
+      enableTelnet();
+      server.send(200, "text/plain", getLangText(41)); // Telnet enabled
+    } else {
+      disableTelnet();
+      server.send(200, "text/plain", getLangText(42)); // Telnet disabled
+    }
+  } else {
+    // Toggle
+    telnetEnabled = !telnetEnabled;
+    setupTelnet();
+    server.send(200, "text/plain", telnetEnabled ? getLangText(41) : getLangText(42));
+  }
+}
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
@@ -1264,8 +1567,13 @@ void setup() {
   server.on("/logs", handleLogs);
   server.on("/clear-logs", handleClearLogs);
   server.on("/set-ap-password", handleSetAPPassword);
+  server.on("/telnet", handleTelnetToggle);
   server.begin();
   logMessage("Web server started on port 80");
+
+  // Setup Telnet (enabled by default)
+  telnetEnabled = true;
+  setupTelnet();
 
   // Generate HTML page
   htmlPage = generateHtmlPage();
@@ -1290,6 +1598,11 @@ void loop() {
   
   // Handle mDNS
   MDNS.update();
+  
+  // Handle Telnet clients
+  if (telnetEnabled) {
+    handleTelnetClients();
+  }
   
   // Check AP timeout
   checkAPTimeout();
