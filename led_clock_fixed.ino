@@ -2,46 +2,222 @@
 #include <time.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+#include <ESP8266mDNS.h>
+#include <ArduinoOTA.h>
 
-// ================= ТОЧКА ДОСТУПА ДЛЯ НАСТРОЙКИ =================
+// ================= VERSION =================
+const char* FIRMWARE_VERSION = "2.0.0";
+
+// ================= LANGUAGE SUPPORT =================
+enum Language { RU, EN };
+Language currentLanguage = RU;
+
+// Language strings
+const char* LANG_RU[] = {
+  "LED Часы",
+  "Настройка часов",
+  "Ночной режим",
+  "Яркость",
+  "Мигание точек",
+  "Часовой пояс",
+  "Настройка Wi-Fi",
+  "Текущая сеть",
+  "Имя Wi-Fi сети (SSID)",
+  "Пароль Wi-Fi",
+  "Сохранить и перезагрузить",
+  "Синхронизировать время",
+  "Сброс Wi-Fi настроек",
+  "IP адрес",
+  "Не найдено",
+  "Синхронизация времени...",
+  "Время синхронизировано!",
+  "Ошибка: введите имя сети!",
+  "Ошибка: SSID слишком длинный!",
+  "Ошибка: пароль слишком длинный!",
+  "Ошибка: не указаны SSID или пароль",
+  "Сохранено! Перезагрузка через 3 сек...",
+  "Настройки сброшены! Перезагрузка...",
+  "Вы уверены? Часы сбросят настройки Wi-Fi и создадут точку доступа",
+  "Сброс...",
+  "Ошибка",
+  "OK",
+  "Обновление прошивки",
+  "Текущая версия",
+  "Проверка обновлений...",
+  "Доступно обновление!",
+  "Прошивка актуальна",
+  "Логи",
+  "Очистить логи",
+  "Скачать логи",
+  "Назад",
+  "Сохранить",
+  "Отмена",
+  "Язык",
+  "Русский",
+  "Английский",
+  "Включено",
+  "Выключено",
+  "Слабый сигнал Wi-Fi",
+  "Не удалось подключиться к Wi-Fi",
+  "NTP сервер недоступен",
+  "Используется резервный NTP сервер"
+};
+
+const char* LANG_EN[] = {
+  "LED Clock",
+  "Clock Setup",
+  "Night Mode",
+  "Brightness",
+  "Blink Dots",
+  "Time Zone",
+  "Wi-Fi Setup",
+  "Current Network",
+  "Wi-Fi Name (SSID)",
+  "Wi-Fi Password",
+  "Save and Restart",
+  "Sync Time",
+  "Reset Wi-Fi Settings",
+  "IP Address",
+  "Not found",
+  "Syncing time...",
+  "Time synchronized!",
+  "Error: Enter SSID!",
+  "Error: SSID too long!",
+  "Error: Password too long!",
+  "Error: SSID or password not specified",
+  "Saved! Restarting in 3 sec...",
+  "Settings reset! Restarting...",
+  "Are you sure? This will reset Wi-Fi settings and create an AP",
+  "Resetting...",
+  "Error",
+  "OK",
+  "Firmware Update",
+  "Current Version",
+  "Checking for updates...",
+  "Update available!",
+  "Firmware is up to date",
+  "Logs",
+  "Clear Logs",
+  "Download Logs",
+  "Back",
+  "Save",
+  "Cancel",
+  "Language",
+  "Russian",
+  "English",
+  "On",
+  "Off",
+  "Weak Wi-Fi Signal",
+  "Failed to connect to Wi-Fi",
+  "NTP server unavailable",
+  "Using fallback NTP server"
+};
+
+const char** getLangStrings() {
+  return currentLanguage == RU ? LANG_RU : LANG_EN;
+}
+
+// ================= LOGGING =================
+#define LOG_BUFFER_SIZE 2048
+char logBuffer[LOG_BUFFER_SIZE] = "";
+
+void logMessage(const char* message, bool isError = false) {
+  static unsigned long lastLogTime = 0;
+  unsigned long currentTime = millis();
+  
+  // Add timestamp
+  char timestamp[20];
+  unsigned long uptime = currentTime / 1000;
+  unsigned int hours = uptime / 3600;
+  unsigned int minutes = (uptime % 3600) / 60;
+  unsigned int seconds = uptime % 60;
+  snprintf(timestamp, sizeof(timestamp), "[%02u:%02u:%02u] ", hours, minutes, seconds);
+  
+  // Format log message
+  char logEntry[256];
+  const char* prefix = isError ? "[ERROR] " : "[INFO] ";
+  snprintf(logEntry, sizeof(logEntry), "%s%s%s\n", timestamp, prefix, message);
+  
+  // Add to buffer
+  int logLen = strlen(logBuffer);
+  int entryLen = strlen(logEntry);
+  if (logLen + entryLen < LOG_BUFFER_SIZE - 1) {
+    strcat(logBuffer, logEntry);
+  } else {
+    // Shift buffer to make room
+    memmove(logBuffer, logBuffer + (logLen - (LOG_BUFFER_SIZE / 2)), LOG_BUFFER_SIZE / 2);
+    logBuffer[LOG_BUFFER_SIZE / 2] = '\0';
+    strcat(logBuffer, logEntry);
+  }
+  
+  // Print to Serial
+  Serial.print(logEntry);
+  
+  lastLogTime = currentTime;
+}
+
+String getLogs() {
+  return String(logBuffer);
+}
+
+void clearLogs() {
+  logBuffer[0] = '\0';
+  logMessage("Logs cleared");
+}
+
+// ================= AP CONFIG =================
 const char* apSSID = "Clock-Setup";
-const char* apPassword = "12345678"; // Пароль от точки доступа (минимум 8 символов)
-const unsigned long apTimeout = 180000;   // AP отключится через 3 минуты БЕЗДЕЙСТВИЯ
+const char* DEFAULT_AP_PASSWORD = "12345678";
+const unsigned long apTimeout = 180000; // 3 minutes
 
-// Статический IP ТОЛЬКО для точки доступа (чтобы всегда знать адрес настройки)
 IPAddress apIP(192, 168, 4, 1);
 IPAddress apGateway(192, 168, 4, 1);
 IPAddress apSubnet(255, 255, 255, 0);
 
-// ================= ПИНЫ СДВИГОВЫХ РЕГИСТРОВ 74HC595 =================
+// ================= SHIFT REGISTER PINS =================
 const int DATA_PIN  = 13;
 const int CLOCK_PIN = 14;
 const int LATCH_PIN = 12;
 
-// ================= НАСТРОЙКИ ВРЕМЕНИ =================
-long gmtOffsetSec = 3 * 3600;           // теперь не константа — задаётся через веб-интерфейс
+// ================= TIME CONFIG =================
+long gmtOffsetSec = 3 * 3600; // Default UTC+3
 const int daylightOffset_sec = 0;
-const char* ntpServer = "pool.ntp.org";
+const char* ntpServers[] = {
+  "pool.ntp.org",
+  "time.google.com",
+  "time.nist.gov",
+  "time.windows.com",
+  "0.pool.ntp.org",
+  "1.pool.ntp.org",
+  "2.pool.ntp.org",
+  "3.pool.ntp.org"
+};
+const int NUM_NTP_SERVERS = 8;
+int currentNtpServerIndex = 0;
 
-// ================= ХРАНИЛИЩЕ НАСТРОЕК В EEPROM =================
+// ================= EEPROM CONFIG =================
 const uint32_t CONFIG_MAGIC = 0xC10CFEED;
+const int EEPROM_SIZE = 1024;
 
-struct WiFiConfig {
+struct Config {
   uint32_t magic;
   char ssid[33];
   char password[65];
+  char apPassword[65];
   bool configured;
   bool nightMode;
   bool blinkDots;
   long gmtOffsetSec;
+  uint8_t brightness; // 0-100%
+  Language language;
 };
 
-WiFiConfig wifiConfig;
-const int EEPROM_SIZE = 512;
+Config config;
 
-// ================= ГЛОБАЛЬНЫЕ НАСТРОЙКИ =================
+// ================= GLOBAL VARIABLES =================
 bool blinkDots = true;
 bool nightMode = false;
+uint8_t brightness = 100; // Default 100%
 
 const byte customDigitMap[10] = {
   0b01111110, 0b00001100, 0b10110110, 0b10011110, 0b11001100,
@@ -53,56 +229,81 @@ ESP8266WebServer server(80);
 unsigned long apStartTime = 0;
 bool apActive = false;
 
-// Отложенная (неблокирующая) перезагрузка
+// Deferred restart
 bool pendingRestart = false;
 unsigned long restartAtMillis = 0;
 
-// ================= ФУНКЦИИ EEPROM =================
-void saveWiFiConfig() {
-  wifiConfig.magic = CONFIG_MAGIC;
-  EEPROM.put(0, wifiConfig);
+// Timing variables
+unsigned long lastTimeUpdate = 0;
+unsigned long lastPWMStep = 0;
+unsigned long lastNtpSyncAttempt = 0;
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long NTP_SYNC_INTERVAL = 3600000; // 1 hour
+const unsigned long WIFI_RECONNECT_INTERVAL = 30000; // 30 seconds
+
+int pwmStep = 0;
+const int PWM_STEPS = 20;
+const unsigned long PWM_STEP_MS = 1;
+
+int curHour = 0, curMinute = 0, curSecond = 0;
+bool timeOK = false;
+bool ntpSynced = false;
+
+// ================= EEPROM FUNCTIONS =================
+void saveConfig() {
+  config.magic = CONFIG_MAGIC;
+  config.nightMode = nightMode;
+  config.blinkDots = blinkDots;
+  config.gmtOffsetSec = gmtOffsetSec;
+  config.brightness = brightness;
+  config.language = currentLanguage;
+  
+  EEPROM.put(0, config);
   EEPROM.commit();
-  Serial.println("Настройки сохранены в EEPROM");
+  logMessage("Configuration saved to EEPROM");
 }
 
-void loadWiFiConfig() {
+void loadConfig() {
   EEPROM.begin(EEPROM_SIZE);
-  EEPROM.get(0, wifiConfig);
+  EEPROM.get(0, config);
 
-  if (wifiConfig.magic != CONFIG_MAGIC) {
-    // Первая загрузка или повреждённые данные — используем значения по умолчанию
-    Serial.println("Конфигурация не найдена. Использую значения по умолчанию.");
-    wifiConfig.ssid[0] = '\0';
-    wifiConfig.password[0] = '\0';
-    wifiConfig.configured = false;
-    wifiConfig.nightMode = false;
-    wifiConfig.blinkDots = true;
-    wifiConfig.gmtOffsetSec = 3 * 3600;
-    saveWiFiConfig();
+  if (config.magic != CONFIG_MAGIC) {
+    logMessage("No valid config found. Using defaults.");
+    strncpy(config.ssid, "", sizeof(config.ssid));
+    strncpy(config.password, "", sizeof(config.password));
+    strncpy(config.apPassword, DEFAULT_AP_PASSWORD, sizeof(config.apPassword));
+    config.configured = false;
+    config.nightMode = false;
+    config.blinkDots = true;
+    config.gmtOffsetSec = 3 * 3600;
+    config.brightness = 100;
+    config.language = RU;
+    saveConfig();
   }
 
-  nightMode   = wifiConfig.nightMode;
-  blinkDots   = wifiConfig.blinkDots;
-  gmtOffsetSec = wifiConfig.gmtOffsetSec;
+  nightMode = config.nightMode;
+  blinkDots = config.blinkDots;
+  gmtOffsetSec = config.gmtOffsetSec;
+  brightness = config.brightness;
+  currentLanguage = config.language;
 
-  if (!wifiConfig.configured || wifiConfig.ssid[0] == '\0') {
-    Serial.println("Настройки Wi-Fi не найдены. Будет запущена точка доступа.");
-    wifiConfig.configured = false;
+  if (!config.configured || config.ssid[0] == '\0') {
+    logMessage("Wi-Fi not configured. Will start AP mode.");
+    config.configured = false;
   } else {
-    Serial.print("Загружены настройки Wi-Fi: ");
-    Serial.println(wifiConfig.ssid);
+    logMessage(String("Loaded Wi-Fi config: ") + config.ssid);
   }
 }
 
-void resetWiFiConfig() {
-  wifiConfig.configured = false;
-  wifiConfig.ssid[0] = '\0';
-  wifiConfig.password[0] = '\0';
-  saveWiFiConfig();
-  Serial.println("Настройки Wi-Fi сброшены");
+void resetConfig() {
+  strncpy(config.ssid, "", sizeof(config.ssid));
+  strncpy(config.password, "", sizeof(config.password));
+  config.configured = false;
+  saveConfig();
+  logMessage("Configuration reset");
 }
 
-// ================= JSON-ЭКРАНИРОВАНИЕ =================
+// ================= JSON ESCAPE =================
 String jsonEscape(const String &s) {
   String out;
   out.reserve(s.length() + 4);
@@ -127,34 +328,44 @@ String jsonEscape(const String &s) {
   return out;
 }
 
-// ================= НЕБЛОКИРУЮЩАЯ ПЕРЕЗАГРУЗКА =================
+// ================= RESTART FUNCTIONS =================
 void scheduleRestart(unsigned long delayMs) {
   pendingRestart = true;
   restartAtMillis = millis() + delayMs;
+  logMessage(String("Restart scheduled in ") + delayMs + "ms");
 }
 
 void handlePendingRestart() {
   if (pendingRestart && (long)(millis() - restartAtMillis) >= 0) {
+    logMessage("Performing scheduled restart...");
     ESP.restart();
   }
 }
 
-// ================= АКТИВНОСТЬ СБРАСЫВАЕТ ТАЙМАУТ AP =================
+// ================= AP FUNCTIONS =================
 void touchAP() {
   if (apActive) {
     apStartTime = millis();
   }
 }
 
-// ================= ФУНКЦИЯ ОБНОВЛЕНИЯ ДИСПЛЕЯ =================
-// visible=false используется для программного ШИМ (диммирования) в ночном режиме:
-// на части кадров дисплей полностью гасится, создавая иллюзию сниженной яркости.
+void checkAPTimeout() {
+  if (apActive && (millis() - apStartTime > apTimeout)) {
+    logMessage("AP timeout reached. Disabling AP mode.");
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apActive = false;
+    logMessage("AP mode disabled");
+  }
+}
+
+// ================= DISPLAY FUNCTIONS =================
 void updateDisplay(int h, int m, int s, bool visible) {
   digitalWrite(LATCH_PIN, LOW);
 
   if (!visible) {
     for (int i = 0; i < 6; i++) {
-      shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0xFF); // все сегменты выключены
+      shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0xFF); // All segments off
     }
     digitalWrite(LATCH_PIN, HIGH);
     return;
@@ -168,13 +379,16 @@ void updateDisplay(int h, int m, int s, bool visible) {
   digits[4] = customDigitMap[s / 10];
   digits[5] = customDigitMap[s % 10];
 
+  // Apply brightness via PWM simulation
+  // We'll handle this in the main loop with the visible parameter
+
   if (blinkDots && (s % 2 != 0)) {
-    digits[0] |= 0b00000001;
-    digits[1] |= 0b00000001;
-    digits[2] |= 0b00000001;
-    digits[3] |= 0b00000001;
-    digits[4] |= 0b00000001;
-    digits[5] |= 0b00000001;
+    digits[0] |= 0b00000001; // Dot for hour tens
+    digits[1] |= 0b00000001; // Dot for hour units
+    digits[2] |= 0b00000001; // Dot for minute tens
+    digits[3] |= 0b00000001; // Dot for minute units
+    digits[4] |= 0b00000001; // Dot for second tens
+    digits[5] |= 0b00000001; // Dot for second units
   }
 
   for (int i = 0; i < 6; i++) {
@@ -184,18 +398,210 @@ void updateDisplay(int h, int m, int s, bool visible) {
   digitalWrite(LATCH_PIN, HIGH);
 }
 
-// ================= ВЕБ-ИНТЕРФЕЙС =================
-const char* htmlPage = R"rawliteral(
-<!DOCTYPE html>
-<html lang="ru">
+// ================= TIME FUNCTIONS =================
+bool syncTimeWithNTP() {
+  static bool firstAttempt = true;
+  
+  if (firstAttempt) {
+    firstAttempt = false;
+    logMessage("First NTP sync attempt...");
+  }
+
+  // Try current server
+  configTime(gmtOffsetSec, daylightOffset_sec, ntpServers[currentNtpServerIndex]);
+  
+  // Wait for time to be set
+  time_t now = time(nullptr);
+  unsigned long startTime = millis();
+  int attempts = 0;
+  
+  unsigned long lastAttemptTime = startTime;
+  while (now < 946684800 && attempts < 10) { // 946684800 = 2000-01-01
+    if (millis() - lastAttemptTime >= 500) {
+      now = time(nullptr);
+      attempts++;
+      lastAttemptTime = millis();
+    }
+    if (millis() - startTime > 5000) break; // Timeout after 5 seconds
+    yield();
+  }
+  
+  if (now >= 946684800) {
+    logMessage(String("NTP sync successful with server: ") + ntpServers[currentNtpServerIndex]);
+    ntpSynced = true;
+    return true;
+  } else {
+    logMessage(String("NTP sync failed with server: ") + ntpServers[currentNtpServerIndex], true);
+    
+    // Try next server
+    currentNtpServerIndex = (currentNtpServerIndex + 1) % NUM_NTP_SERVERS;
+    
+    if (attempts >= NUM_NTP_SERVERS) {
+      logMessage("All NTP servers failed. Will retry later.", true);
+      currentNtpServerIndex = 0; // Reset to first server
+      return false;
+    }
+    
+    return false;
+  }
+}
+
+void checkTimeSync() {
+  unsigned long now = millis();
+  
+  // Initial sync
+  if (!ntpSynced && WiFi.status() == WL_CONNECTED) {
+    if (now - lastNtpSyncAttempt > 10000) { // Try every 10 seconds
+      lastNtpSyncAttempt = now;
+      syncTimeWithNTP();
+    }
+  }
+  
+  // Periodic resync
+  if (ntpSynced && now - lastNtpSyncAttempt > NTP_SYNC_INTERVAL) {
+    lastNtpSyncAttempt = now;
+    logMessage("Periodic NTP resync...");
+    syncTimeWithNTP();
+  }
+}
+
+// ================= WIFI FUNCTIONS =================
+bool connectToWiFi() {
+  if (!config.configured || strlen(config.ssid) == 0) {
+    logMessage("Wi-Fi not configured. Starting AP mode.");
+    return false;
+  }
+
+  logMessage(String("Connecting to Wi-Fi: ") + config.ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(config.ssid, config.password);
+
+  unsigned long startTime = millis();
+  int attempts = 0;
+  
+  unsigned long lastAttemptTime = startTime;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    if (millis() - startTime > 15000) break; // 15 second timeout
+    if (millis() - lastAttemptTime >= 500) {
+      attempts++;
+      lastAttemptTime = millis();
+    }
+    yield();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    logMessage(String("Wi-Fi connected! IP: ") + WiFi.localIP().toString());
+    return true;
+  } else {
+    logMessage(String("Failed to connect to Wi-Fi: ") + config.ssid, true);
+    return false;
+  }
+}
+
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED && config.configured && strlen(config.ssid) > 0) {
+    unsigned long now = millis();
+    if (now - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
+      lastWiFiReconnectAttempt = now;
+      logMessage("Attempting to reconnect to Wi-Fi...");
+      if (!connectToWiFi()) {
+        // If still not connected, start AP mode
+        if (!apActive) {
+          setupAP();
+        }
+      }
+    }
+  }
+}
+
+void setupAP() {
+  logMessage("Starting AP mode...");
+  
+  // Generate a random password if not set
+  if (strlen(config.apPassword) == 0) {
+    strncpy(config.apPassword, DEFAULT_AP_PASSWORD, sizeof(config.apPassword));
+  }
+  
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(apIP, apGateway, apSubnet);
+  WiFi.softAP(apSSID, config.apPassword);
+
+  logMessage(String("AP started. SSID: ") + apSSID + ", IP: " + WiFi.softAPIP().toString());
+  apActive = true;
+  apStartTime = millis();
+}
+
+// ================= OTA FUNCTIONS =================
+void setupOTA() {
+  logMessage("Setting up OTA...");
+  
+  // Hostname defaults to esp8266-[ChipID]
+  String hostname = "LED-Clock-";
+  hostname += String(ESP.getChipId(), HEX);
+  
+  ArduinoOTA.setHostname(hostname.c_str());
+  ArduinoOTA.setPort(8266);
+  ArduinoOTA.setPassword("ota123"); // Default OTA password
+  
+  ArduinoOTA.onStart([]() {
+    logMessage("OTA update started");
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    logMessage("OTA update finished");
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (progress % (total / 10) == 0) {
+      logMessage(String("OTA progress: ") + (progress / (total / 100)) + "%");
+    }
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    String errorMsg = "OTA Error: ";
+    switch (error) {
+      case OTA_AUTH_ERROR: errorMsg += "Auth Failed"; break;
+      case OTA_BEGIN_ERROR: errorMsg += "Begin Failed"; break;
+      case OTA_CONNECT_ERROR: errorMsg += "Connect Failed"; break;
+      case OTA_RECEIVE_ERROR: errorMsg += "Receive Failed"; break;
+      case OTA_END_ERROR: errorMsg += "End Failed"; break;
+      default: errorMsg += String(error); break;
+    }
+    logMessage(errorMsg.c_str(), true);
+  });
+  
+  ArduinoOTA.begin();
+  logMessage(String("OTA ready. Hostname: ") + hostname + ", Port: 8266");
+}
+
+// ================= WEB HANDLERS =================
+String getLangText(int index) {
+  const char** strings = getLangStrings();
+  if (index >= 0 && index < (sizeof(LANG_RU) / sizeof(LANG_RU[0]))) {
+    return String(strings[index]);
+  }
+  return "";
+}
+
+String generateHtmlPage() {
+  const char** lang = getLangStrings();
+  
+  String html = R"rawliteral(<!DOCTYPE html>
+<html>)rawliteral";
+  html += String("\n<html lang=\"") + (currentLanguage == RU ? "ru" : "en") + "\">";
+  html += R"rawliteral(
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Управление часами</title>
+  <title>)rawliteral";
+  html += getLangText(0); // LED Clock
+  html += R"rawliteral(</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
            background-color: #121212; color: #e0e0e0; text-align: center; padding: 20px; margin: 0; }
     h1 { color: #4CAF50; }
+    h2 { color: #4CAF50; margin: 5px 0; }
     .card { background: #1e1e1e; border-radius: 12px; padding: 20px; margin: 15px auto; max-width: 400px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     .switch { position: relative; display: inline-block; width: 60px; height: 34px; margin: 10px; }
     .switch input { opacity: 0; width: 0; height: 0; }
@@ -203,69 +609,269 @@ const char* htmlPage = R"rawliteral(
     .slider:before { position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
     input:checked + .slider { background-color: #4CAF50; }
     input:checked + .slider:before { transform: translateX(26px); }
-    button { background-color: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+    button { background-color: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; cursor: pointer; margin: 5px; }
     button:hover { background-color: #45a049; }
     button.danger { background-color: #ff6b6b; }
     button.danger:hover { background-color: #ee5a52; }
+    button.secondary { background-color: #607d8b; }
+    button.secondary:hover { background-color: #546e7a; }
     input[type="text"], input[type="password"], select { width: 90%; padding: 10px; margin: 8px 0; border-radius: 6px; border: 1px solid #333; background: #2a2a2a; color: #fff; font-size: 14px; box-sizing: border-box; }
+    .slider-container { margin: 20px 0; }
+    .slider-label { display: flex; justify-content: space-between; margin-bottom: 5px; }
+    input[type="range"] { width: 100%; height: 8px; border-radius: 4px; background: #333; outline: none; -webkit-appearance: none; }
+    input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #4CAF50; cursor: pointer; }
     .status { font-size: 14px; color: #888; margin-top: 10px; }
     .info { font-size: 12px; color: #aaa; margin-top: 5px; }
+    .error { color: #ff6b6b; }
+    .success { color: #4CAF50; }
     hr { border: none; border-top: 1px solid #333; margin: 20px auto; max-width: 400px; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+    .tabs { margin: 20px 0; }
+    .tab-button { padding: 10px 20px; margin: 0 5px; background: #2a2a2a; border: none; color: #aaa; cursor: pointer; border-radius: 6px; }
+    .tab-button.active { background: #1e1e1e; color: #4CAF50; }
+    .tab-button:hover { background: #333; }
+    .log-container { background: #000; color: #0f0; font-family: monospace; padding: 10px; border-radius: 6px; text-align: left; max-height: 300px; overflow-y: auto; white-space: pre-wrap; font-size: 12px; }
+    .log-line.error { color: #f88; }
+    a { color: #4CAF50; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .version { font-size: 12px; color: #888; margin-top: 20px; }
   </style>
 </head>
 <body>
-  <h1>⏰ LED Часы</h1>
-
-  <div class="card">
-    <h3>🌙 Ночной режим (яркость ×0.5)</h3>
-    <label class="switch">
-      <input type="checkbox" id="nightMode" onchange="toggleSetting('night', this.checked)">
-      <span class="slider"></span>
-    </label>
+  <h1>[1;32m)rawliteral";
+  html += getLangText(0); // LED Clock
+  html += R"rawliteral(</h1>
+  <p class="version">)rawliteral";
+  html += getLangText(21); // Current Version
+  html += String(": ") + FIRMWARE_VERSION + "</p>";
+  
+  // Tabs
+  html += R"rawliteral(
+  <div class="tabs">
+    <button class="tab-button active" onclick="showTab('main')">)rawliteral";
+  html += getLangText(1); // Clock Setup
+  html += R"rawliteral(</button>
+    <button class="tab-button" onclick="showTab('wifi')">)rawliteral";
+  html += getLangText(6); // Wi-Fi Setup
+  html += R"rawliteral(</button>
+    <button class="tab-button" onclick="showTab('ota')">OTA</button>
+    <button class="tab-button" onclick="showTab('logs')">)rawliteral";
+  html += getLangText(25); // Logs
+  html += R"rawliteral(</button>
+    <button class="tab-button" onclick="showTab('settings')">Settings</button>
   </div>
 
-  <div class="card">
-    <h3>✨ Мигающие точки</h3>
-    <label class="switch">
-      <input type="checkbox" id="blinkDots" checked onchange="toggleSetting('blink', this.checked)">
-      <span class="slider"></span>
-    </label>
+  <!-- Main Tab -->
+  <div id="main" class="tab active">
+    <div class="card">
+      <h3>[1;33m)rawliteral";
+  html += getLangText(2); // Night Mode
+  html += R"rawliteral( ([0m)rawliteral";
+  html += getLangText(16); // On
+  html += String(" x0.5)") + R"rawliteral(</h3>
+      <label class="switch">
+        <input type="checkbox" id="nightMode" onchange="toggleSetting('night', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h3>)rawliteral";
+  html += getLangText(3); // Brightness
+  html += R"rawliteral(</h3>
+      <div class="slider-container">
+        <div class="slider-label">
+          <span>0%</span>
+          <span id="brightnessValue">100%</span>
+        </div>
+        <input type="range" id="brightness" min="0" max="100" value=")rawliteral";
+  html += String(brightness);
+  html += R"rawliteral(" oninput="updateBrightnessValue(this.value)" onchange="setBrightness(this.value)">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>)rawliteral";
+  html += getLangText(4); // Blink Dots
+  html += R"rawliteral(</h3>
+      <label class="switch">
+        <input type="checkbox" id="blinkDots" checked onchange="toggleSetting('blink', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="card">
+      <h3>[1;36m)rawliteral";
+  html += getLangText(5); // Time Zone
+  html += R"rawliteral(</h3>
+      <select id="tzSelect" onchange="setTimezone(this.value)"></select>
+    </div>
+
+    <div class="card">
+      <button onclick="syncTime()">[1;34m)rawliteral";
+  html += getLangText(11); // Sync Time
+  html += R"rawliteral(</button>
+      <p id="syncStatus" class="status"></p>
+    </div>
   </div>
 
-  <div class="card">
-    <h3>🌍 Часовой пояс</h3>
-    <select id="tzSelect" onchange="setTimezone(this.value)"></select>
+  <!-- Wi-Fi Tab -->
+  <div id="wifi" class="tab">
+    <div class="card">
+      <h3>[1;35m)rawliteral";
+  html += getLangText(6); // Wi-Fi Setup
+  html += R"rawliteral(</h3>
+      <p class="info">)rawliteral";
+  html += getLangText(7); // Current Network
+  html += String(": <span id="currentSSID">-</span></p>
+      <input type="text" id="newSSID" placeholder=")rawliteral";
+  html += getLangText(8); // Wi-Fi Name (SSID)
+  html += R"rawliteral(" maxlength="32">
+      <input type="password" id="newPassword" placeholder=")rawliteral";
+  html += getLangText(9); // Wi-Fi Password
+  html += R"rawliteral(" maxlength="64">
+      <button onclick="saveWiFi()">)rawliteral";
+  html += getLangText(10); // Save and Restart
+  html += R"rawliteral(</button>
+      <p id="wifiStatus" class="status"></p>
+    </div>
+
+    <div class="card" style="background: #3d1f1f;">
+      <h3 style="color: #ff6b6b;">[1;31m[0m[1;31m[0m[1;31m[0m [1;31m)rawliteral";
+  html += getLangText(12); // Reset Wi-Fi Settings
+  html += R"rawliteral(</h3>
+      <p class="info">)rawliteral";
+  html += getLangText(13); // IP Address
+  html += String(": <span id="ipAddr">-</span></p>
+      <p class="info">[1;33mAP: [0m)rawliteral";
+  html += String(apSSID) + " (" + getLangText(13) + ": 192.168.4.1)</p>
+      <button class="danger" onclick="resetWiFi()">[1;31m[0m)rawliteral";
+  html += getLangText(12); // Reset Wi-Fi Settings
+  html += R"rawliteral(</button>
+      <p id="resetStatus" class="status"></p>
+    </div>
   </div>
 
-  <hr>
-
-  <div class="card">
-    <h3>📶 Настройка Wi-Fi</h3>
-    <p class="info">Текущая сеть: <span id="currentSSID">-</span></p>
-    <input type="text" id="newSSID" placeholder="Имя Wi-Fi сети (SSID)" maxlength="32">
-    <input type="password" id="newPassword" placeholder="Пароль Wi-Fi" maxlength="64">
-    <button onclick="saveWiFi()">💾 Сохранить и перезагрузить</button>
-    <p id="wifiStatus" class="status"></p>
+  <!-- OTA Tab -->
+  <div id="ota" class="tab">
+    <div class="card">
+      <h3>OTA Firmware Update</h3>
+      <p class="info">Hostname: <code id="otaHostname">-</code></p>
+      <p class="info">Port: 8266</p>
+      <p class="info">Password: ota123</p>
+      <p class="status">To update: Upload .bin file via Arduino IDE or PlatformIO to LED-Clock-[CHIPID].local:8266</p>
+      <p class="status">Current version: )rawliteral";
+  html += String(FIRMWARE_VERSION);
+  html += R"rawliteral(</p>
+    </div>
   </div>
 
-  <div class="card">
-    <button onclick="syncTime()">🔄 Синхронизировать время</button>
-    <p id="syncStatus" class="status"></p>
+  <!-- Logs Tab -->
+  <div id="logs" class="tab">
+    <div class="card">
+      <h3>)rawliteral";
+  html += getLangText(25); // Logs
+  html += R"rawliteral(</h3>
+      <div class="log-container" id="logContainer"></div>
+      <button onclick="refreshLogs()">)rawliteral";
+  html += getLangText(26); // Refresh
+  html += R"rawliteral(</button>
+      <button onclick="clearLogs()">)rawliteral";
+  html += getLangText(27); // Clear Logs
+  html += R"rawliteral(</button>
+      <button onclick="downloadLogs()">)rawliteral";
+  html += getLangText(28); // Download Logs
+  html += R"rawliteral(</button>
+    </div>
   </div>
 
-  <hr>
-
-  <div class="card" style="background: #3d1f1f;">
-    <h3 style="color: #ff6b6b;">⚠️ Сброс Wi-Fi настроек</h3>
-    <p class="info">Часы перезагрузятся и создадут точку доступа <b>Clock-Setup</b> (пароль: 12345678, адрес: 192.168.4.1)</p>
-    <button class="danger" onclick="resetWiFi()">🔄 Сбросить Wi-Fi</button>
-    <p id="resetStatus" class="status"></p>
+  <!-- Settings Tab -->
+  <div id="settings" class="tab">
+    <div class="card">
+      <h3>Additional Settings</h3>
+      <div class="card">
+        <h4>)rawliteral";
+  html += getLangText(33); // Language
+  html += R"rawliteral(</h4>
+        <select id="languageSelect" onchange="setLanguage(this.value)">
+          <option value="ru" )rawliteral";
+  html += (currentLanguage == RU ? "selected" : "");
+  html += R"rawliteral(>)rawliteral";
+  html += getLangText(34); // Russian
+  html += R"rawliteral(</option>
+          <option value="en" )rawliteral";
+  html += (currentLanguage == EN ? "selected" : "");
+  html += R"rawliteral(>)rawliteral";
+  html += getLangText(35); // English
+  html += R"rawliteral(</option>
+        </select>
+      </div>
+      <button onclick="saveSettings()">)rawliteral";
+  html += getLangText(31); // Save
+  html += R"rawliteral(</button>
+      <p id="settingsStatus" class="status"></p>
+    </div>
+    
+    <div class="card">
+      <h3>AP Password</h3>
+      <input type="password" id="apPassword" placeholder="New AP Password" maxlength="64">
+      <button onclick="saveAPPassword()">Set AP Password</button>
+      <p id="apPasswordStatus" class="status"></p>
+    </div>
   </div>
-
-  <p class="status">IP устройства: <span id="ipAddr"></span></p>
 
   <script>
-    // Заполняем список часовых поясов UTC-12 .. UTC+14
+    // Language strings for JavaScript
+    const lang = {
+      syncing: ")rawliteral";
+  html += getLangText(15); // Syncing time...
+  html += R"rawliteral(",
+      synced: ")rawliteral";
+  html += getLangText(16); // Time synchronized!
+  html += R"rawliteral(",
+      errorNoSSID: ")rawliteral";
+  html += getLangText(17); // Error: Enter SSID!
+  html += R"rawliteral(",
+      errorSSIDLong: ")rawliteral";
+  html += getLangText(18); // Error: SSID too long!
+  html += R"rawliteral(",
+      errorPasswordLong: ")rawliteral";
+  html += getLangText(19); // Error: Password too long!
+  html += R"rawliteral(",
+      errorNoCredentials: ")rawliteral";
+  html += getLangText(20); // Error: SSID or password not specified
+  html += R"rawliteral(",
+      savedRestart: ")rawliteral";
+  html += getLangText(21); // Saved! Restarting in 3 sec...
+  html += R"rawliteral(",
+      resetConfirm: ")rawliteral";
+  html += getLangText(22); // Are you sure?...
+  html += R"rawliteral(",
+      resetting: ")rawliteral";
+  html += getLangText(23); // Resetting...
+  html += R"rawliteral(",
+      error: ")rawliteral";
+  html += getLangText(24); // Error
+  html += R"rawliteral(",
+      ok: ")rawliteral";
+  html += getLangText(29) // OK
+  html += R"rawliteral("
+    };
+
+    // Tab switching
+    function showTab(tabName) {
+      document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+      document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+      document.getElementById(tabName).classList.add('active');
+      event.target.classList.add('active');
+      
+      if (tabName === 'logs') {
+        refreshLogs();
+      }
+    }
+
+    // Fill timezone select
     const tzSelect = document.getElementById('tzSelect');
     for (let h = -12; h <= 14; h++) {
       const opt = document.createElement('option');
@@ -274,20 +880,34 @@ const char* htmlPage = R"rawliteral(
       tzSelect.appendChild(opt);
     }
 
+    // Load initial data
     fetch('/status')
       .then(response => response.json())
       .then(data => {
         document.getElementById('nightMode').checked = data.night;
         document.getElementById('blinkDots').checked = data.blink;
         document.getElementById('ipAddr').innerText = data.ip;
-        document.getElementById('currentSSID').innerText = data.ssid || 'Не настроено';
-        tzSelect.value = data.tz;
+        document.getElementById('currentSSID').innerText = data.ssid || 'Not connected';
+        document.getElementById('tzSelect').value = data.tz;
+        document.getElementById('brightness').value = data.brightness;
+        updateBrightnessValue(data.brightness);
+        document.getElementById('otaHostname').innerText = data.hostname;
       });
 
     function toggleSetting(type, value) {
       fetch('/set?' + type + '=' + (value ? 1 : 0))
         .then(response => response.text())
         .then(text => console.log(text));
+    }
+
+    function setBrightness(value) {
+      fetch('/set?brightness=' + value)
+        .then(response => response.text())
+        .then(text => console.log(text));
+    }
+
+    function updateBrightnessValue(value) {
+      document.getElementById('brightnessValue').innerText = value + '%';
     }
 
     function setTimezone(value) {
@@ -301,53 +921,147 @@ const char* htmlPage = R"rawliteral(
       const password = document.getElementById('newPassword').value;
 
       if (!ssid) {
-        document.getElementById('wifiStatus').innerText = "❌ Введите имя сети!";
+        document.getElementById('wifiStatus').innerText = lang.errorNoSSID;
+        document.getElementById('wifiStatus').className = 'status error';
         return;
       }
       if (ssid.length > 32) {
-        document.getElementById('wifiStatus').innerText = "❌ SSID длиннее 32 символов!";
+        document.getElementById('wifiStatus').innerText = lang.errorSSIDLong;
+        document.getElementById('wifiStatus').className = 'status error';
         return;
       }
       if (password.length > 64) {
-        document.getElementById('wifiStatus').innerText = "❌ Пароль длиннее 64 символов!";
+        document.getElementById('wifiStatus').innerText = lang.errorPasswordLong;
+        document.getElementById('wifiStatus').className = 'status error';
         return;
       }
 
-      document.getElementById('wifiStatus').innerText = "⏳ Сохранение... Часы перезагрузятся через несколько секунд";
+      document.getElementById('wifiStatus').innerText = lang.syncing;
+      document.getElementById('wifiStatus').className = 'status';
 
       fetch('/wifi?ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(password))
         .then(response => response.text())
         .then(text => {
           document.getElementById('wifiStatus').innerText = text;
+          document.getElementById('wifiStatus').className = 'status success';
         });
     }
 
     function syncTime() {
-      document.getElementById('syncStatus').innerText = "⏳ Синхронизация...";
+      document.getElementById('syncStatus').innerText = lang.syncing;
+      document.getElementById('syncStatus').className = 'status';
       fetch('/sync')
         .then(response => response.text())
         .then(text => {
           document.getElementById('syncStatus').innerText = text;
-          setTimeout(() => { document.getElementById('syncStatus').innerText = ""; }, 3000);
+          document.getElementById('syncStatus').className = 'status success';
+          setTimeout(() => { 
+            document.getElementById('syncStatus').innerText = ''; 
+            document.getElementById('syncStatus').className = 'status'; 
+          }, 3000);
         });
     }
 
     function resetWiFi() {
-      if (confirm("Вы уверены? Часы сбросят настройки Wi-Fi и создадут точку доступа Clock-Setup")) {
-        document.getElementById('resetStatus').innerText = "⏳ Сброс... Перезагрузка";
+      if (confirm(lang.resetConfirm)) {
+        document.getElementById('resetStatus').innerText = lang.resetting;
+        document.getElementById('resetStatus').className = 'status';
         fetch('/reset-wifi')
           .then(response => response.text())
           .then(text => {
             document.getElementById('resetStatus').innerText = text;
+            document.getElementById('resetStatus').className = 'status success';
           });
       }
     }
+
+    function refreshLogs() {
+      fetch('/logs')
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('logContainer').innerHTML = text.replace(/\n/g, '<br>');
+        });
+    }
+
+    function clearLogs() {
+      fetch('/clear-logs')
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('logContainer').innerHTML = '';
+        });
+    }
+
+    function downloadLogs() {
+      fetch('/logs')
+        .then(response => response.text())
+        .then(text => {
+          const blob = new Blob([text], { type: 'text/plain' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'clock_logs.txt';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        });
+    }
+
+    function setLanguage(langCode) {
+      fetch('/set?language=' + langCode)
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('settingsStatus').innerText = text;
+          document.getElementById('settingsStatus').className = 'status success';
+          setTimeout(() => {
+            document.getElementById('settingsStatus').innerText = '';
+            document.getElementById('settingsStatus').className = 'status';
+          }, 2000);
+        });
+    }
+
+    function saveSettings() {
+      document.getElementById('settingsStatus').innerText = lang.ok;
+      document.getElementById('settingsStatus').className = 'status success';
+      setTimeout(() => {
+        document.getElementById('settingsStatus').innerText = '';
+        document.getElementById('settingsStatus').className = 'status';
+      }, 2000);
+    }
+
+    function saveAPPassword() {
+      const password = document.getElementById('apPassword').value;
+      if (!password) {
+        document.getElementById('apPasswordStatus').innerText = lang.errorNoSSID;
+        document.getElementById('apPasswordStatus').className = 'status error';
+        return;
+      }
+      
+      fetch('/set-ap-password?password=' + encodeURIComponent(password))
+        .then(response => response.text())
+        .then(text => {
+          document.getElementById('apPasswordStatus').innerText = text;
+          document.getElementById('apPasswordStatus').className = 'status success';
+          document.getElementById('apPassword').value = '';
+        });
+    }
+
+    // Refresh logs every 5 seconds
+    setInterval(() => {
+      if (document.getElementById('logs').classList.contains('active')) {
+        refreshLogs();
+      }
+    }, 5000);
   </script>
 </body>
 </html>
 )rawliteral";
+  
+  return html;
+}
 
-// ================= ОБРАБОТЧИКИ ВЕБ-ЗАПРОСОВ =================
+String htmlPage;
+
 void handleRoot() {
   touchAP();
   server.send(200, "text/html", htmlPage);
@@ -369,16 +1083,35 @@ void handleSet() {
     long tz = server.arg("tz").toInt();
     if (tz >= -12L * 3600 && tz <= 14L * 3600) {
       gmtOffsetSec = tz;
-      configTime(gmtOffsetSec, daylightOffset_sec, ntpServer);
+      configTime(gmtOffsetSec, daylightOffset_sec, ntpServers[currentNtpServerIndex]);
       changed = true;
     }
   }
+  if (server.hasArg("brightness")) {
+    int newBrightness = server.arg("brightness").toInt();
+    if (newBrightness >= 0 && newBrightness <= 100) {
+      brightness = newBrightness;
+      changed = true;
+    }
+  }
+  if (server.hasArg("language")) {
+    String lang = server.arg("language");
+    if (lang == "ru") {
+      currentLanguage = RU;
+    } else if (lang == "en") {
+      currentLanguage = EN;
+    }
+    changed = true;
+    htmlPage = generateHtmlPage(); // Regenerate HTML with new language
+  }
 
   if (changed) {
-    wifiConfig.nightMode = nightMode;
-    wifiConfig.blinkDots = blinkDots;
-    wifiConfig.gmtOffsetSec = gmtOffsetSec;
-    saveWiFiConfig();
+    config.nightMode = nightMode;
+    config.blinkDots = blinkDots;
+    config.gmtOffsetSec = gmtOffsetSec;
+    config.brightness = brightness;
+    config.language = currentLanguage;
+    saveConfig();
   }
 
   server.send(200, "text/plain", "OK");
@@ -386,25 +1119,34 @@ void handleSet() {
 
 void handleStatus() {
   touchAP();
-  String ssid = jsonEscape(String(wifiConfig.ssid));
-  String ip = "не подключен";
+  String ssid = jsonEscape(String(config.ssid));
+  String ip = "Not connected";
   if (WiFi.status() == WL_CONNECTED) {
     ip = WiFi.localIP().toString();
   } else if (apActive) {
     ip = WiFi.softAPIP().toString();
   }
+  
+  String hostname = "LED-Clock-" + String(ESP.getChipId(), HEX);
+  
   String json = "{\"night\":" + String(nightMode ? "true" : "false") +
                 ",\"blink\":" + String(blinkDots ? "true" : "false") +
                 ",\"tz\":" + String(gmtOffsetSec) +
                 ",\"ip\":\"" + ip + "\"" +
-                ",\"ssid\":\"" + ssid + "\"}";
+                ",\"ssid\":\"" + ssid + "\"" +
+                ",\"brightness\":" + String(brightness) +
+                ",\"hostname\":\"" + hostname + "\"" +
+                ",\"ntpSynced\":" + String(ntpSynced ? "true" : "false") +
+                ",\"version\":\"" + String(FIRMWARE_VERSION) + "\"}";
   server.send(200, "application/json", json);
 }
 
 void handleSync() {
   touchAP();
-  configTime(gmtOffsetSec, daylightOffset_sec, ntpServer);
-  server.send(200, "text/plain", "Время синхронизировано!");
+  ntpSynced = false;
+  currentNtpServerIndex = 0;
+  syncTimeWithNTP();
+  server.send(200, "text/plain", getLangText(16)); // Time synchronized!
 }
 
 void handleWiFi() {
@@ -414,153 +1156,156 @@ void handleWiFi() {
     String newPassword = server.arg("password");
 
     if (newSSID.length() == 0) {
-      server.send(400, "text/plain", "Ошибка: имя сети не может быть пустым");
+      server.send(400, "text/plain", getLangText(17)); // Error: Enter SSID!
       return;
     }
-    if (newSSID.length() > sizeof(wifiConfig.ssid) - 1) {
-      server.send(400, "text/plain", "Ошибка: SSID слишком длинный (макс. " + String(sizeof(wifiConfig.ssid) - 1) + " симв.)");
+    if (newSSID.length() > sizeof(config.ssid) - 1) {
+      server.send(400, "text/plain", getLangText(18)); // Error: SSID too long!
       return;
     }
-    if (newPassword.length() > sizeof(wifiConfig.password) - 1) {
-      server.send(400, "text/plain", "Ошибка: пароль слишком длинный (макс. " + String(sizeof(wifiConfig.password) - 1) + " симв.)");
+    if (newPassword.length() > sizeof(config.password) - 1) {
+      server.send(400, "text/plain", getLangText(19)); // Error: Password too long!
       return;
     }
 
-    newSSID.toCharArray(wifiConfig.ssid, sizeof(wifiConfig.ssid));
-    newPassword.toCharArray(wifiConfig.password, sizeof(wifiConfig.password));
-    wifiConfig.configured = true;
+    newSSID.toCharArray(config.ssid, sizeof(config.ssid));
+    newPassword.toCharArray(config.password, sizeof(config.password));
+    config.configured = true;
 
-    saveWiFiConfig();
+    saveConfig();
 
-    server.send(200, "text/plain", "✅ Сохранено! Перезагрузка через 3 сек...");
+    server.send(200, "text/plain", getLangText(21)); // Saved! Restarting...
     scheduleRestart(3000);
   } else {
-    server.send(400, "text/plain", "Ошибка: не указаны SSID или пароль");
+    server.send(400, "text/plain", getLangText(20)); // Error: SSID or password not specified
   }
 }
 
 void handleResetWiFi() {
   touchAP();
-  resetWiFiConfig();
-  server.send(200, "text/plain", "✅ Настройки Wi-Fi сброшены! Перезагрузка...");
+  resetConfig();
+  server.send(200, "text/plain", getLangText(23)); // Resetting...
   scheduleRestart(2000);
 }
 
-// ================= ПОДКЛЮЧЕНИЕ К WI-FI (DHCP) =================
-bool connectToWiFi() {
-  if (!wifiConfig.configured || strlen(wifiConfig.ssid) == 0) {
-    Serial.println("Wi-Fi не настроен. Пропускаем подключение.");
-    return false; // Сразу возвращаем false, чтобы запустить AP
-  }
+void handleLogs() {
+  touchAP();
+  server.send(200, "text/plain", getLogs());
+}
 
-  Serial.print("Подключение к ");
-  Serial.println(wifiConfig.ssid);
+void handleClearLogs() {
+  touchAP();
+  clearLogs();
+  server.send(200, "text/plain", "Logs cleared");
+}
 
-  // СТРОГО DHCP
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiConfig.ssid, wifiConfig.password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi подключен!");
-    Serial.print("IP (DHCP): ");
-    Serial.println(WiFi.localIP());
-    return true;
+void handleSetAPPassword() {
+  touchAP();
+  if (server.hasArg("password")) {
+    String password = server.arg("password");
+    if (password.length() > 0 && password.length() <= sizeof(config.apPassword) - 1) {
+      password.toCharArray(config.apPassword, sizeof(config.apPassword));
+      saveConfig();
+      server.send(200, "text/plain", getLangText(29)); // OK
+      logMessage("AP password updated");
+    } else {
+      server.send(400, "text/plain", getLangText(24)); // Error
+    }
   } else {
-    Serial.println("\nНе удалось подключиться к Wi-Fi");
-    return false;
+    server.send(400, "text/plain", getLangText(24)); // Error
   }
 }
 
-// ================= ЗАПУСК ТОЧКИ ДОСТУПА =================
-void setupAP() {
-  Serial.println("Запуск точки доступа Clock-Setup...");
-  WiFi.mode(WIFI_AP_STA);
-
-  // Статический IP ТОЛЬКО для точки доступа
-  WiFi.softAPConfig(apIP, apGateway, apSubnet);
-  WiFi.softAP(apSSID, apPassword);
-
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
-  apActive = true;
-  apStartTime = millis();
-}
-
-// ================= ПРОВЕРКА ТАЙМАУТА ТОЧКИ ДОСТУПА =================
-void checkAPTimeout() {
-  if (apActive && (millis() - apStartTime > apTimeout)) {
-    Serial.println("Таймаут точки доступа (нет активности) — отключаем AP");
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    apActive = false;
-    Serial.println("Точка доступа отключена");
-  }
-}
-
-// ================= ПЕРЕМЕННЫЕ ГЛАВНОГО ЦИКЛА =================
-unsigned long lastTimeUpdate = 0;
-unsigned long lastPWMStep = 0;
-int pwmStep = 0;
-const int PWM_STEPS = 20;             // шагов на полный цикл диммирования
-const unsigned long PWM_STEP_MS = 1;  // 1 мс/шаг -> полный цикл 20 мс (50 Гц, глазом не улавливается)
-
-int curHour = 0, curMinute = 0, curSecond = 0;
-bool timeOK = false;
-
-// ================= ОСНОВНЫЕ ФУНКЦИИ =================
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
+  unsigned long startTime = millis();
+  while (millis() - startTime < 100) { yield(); } // Small delay for Serial to initialize
+  
+  logMessage("=== LED Clock Firmware v" + String(FIRMWARE_VERSION) + " ===");
+  logMessage("Chip ID: " + String(ESP.getChipId(), HEX));
+  logMessage("Flash Chip ID: " + String(ESP.getFlashChipId(), HEX));
+  logMessage("Free Heap: " + String(ESP.getFreeHeap()) + " bytes");
 
   pinMode(DATA_PIN, OUTPUT);
   pinMode(CLOCK_PIN, OUTPUT);
   pinMode(LATCH_PIN, OUTPUT);
 
-  loadWiFiConfig();
+  loadConfig();
+  logMessage("Configuration loaded");
 
-  // Пытаемся подключиться. Если не удалось (или не настроено) — запускаем AP
+  // Initialize display
+  updateDisplay(0, 0, 0, true);
+
+  // Setup Wi-Fi
+  logMessage("Initializing Wi-Fi...");
   if (!connectToWiFi()) {
     setupAP();
   }
 
+  // Setup OTA
+  setupOTA();
+
+  // Setup mDNS
+  String hostname = "LED-Clock-" + String(ESP.getChipId(), HEX);
+  if (MDNS.begin(hostname.c_str())) {
+    logMessage("mDNS started. Hostname: " + hostname + ".local");
+  } else {
+    logMessage("Failed to start mDNS", true);
+  }
+
+  // Setup web server
   server.on("/", handleRoot);
   server.on("/set", handleSet);
   server.on("/status", handleStatus);
   server.on("/sync", handleSync);
   server.on("/wifi", handleWiFi);
   server.on("/reset-wifi", handleResetWiFi);
+  server.on("/logs", handleLogs);
+  server.on("/clear-logs", handleClearLogs);
+  server.on("/set-ap-password", handleSetAPPassword);
   server.begin();
-  Serial.println("Веб-сервер запущен!");
+  logMessage("Web server started on port 80");
 
+  // Generate HTML page
+  htmlPage = generateHtmlPage();
+  logMessage("HTML page generated");
+
+  // Initial time sync
   if (WiFi.status() == WL_CONNECTED) {
-    configTime(gmtOffsetSec, daylightOffset_sec, ntpServer);
-    Serial.println("Ожидание синхронизации времени...");
-
-    time_t now = time(nullptr);
-    int attempts = 0;
-    while (now < 946684800 && attempts < 20) {
-      delay(500);
-      now = time(nullptr);
-      attempts++;
-    }
-    Serial.println("Время синхронизировано!");
+    logMessage("Attempting initial NTP sync...");
+    syncTimeWithNTP();
   }
+
+  logMessage("Setup complete!");
 }
 
+// ================= LOOP =================
 void loop() {
+  // Handle OTA updates
+  ArduinoOTA.handle();
+  
+  // Handle web server
   server.handleClient();
+  
+  // Handle mDNS
+  MDNS.update();
+  
+  // Check AP timeout
   checkAPTimeout();
+  
+  // Handle pending restart
   handlePendingRestart();
+  
+  // Check Wi-Fi connection
+  checkWiFiConnection();
+  
+  // Check NTP sync
+  checkTimeSync();
 
   unsigned long now = millis();
 
-  // Обновляем текущее время раз в секунду (не блокируя остальной цикл)
+  // Update time every second
   if (now - lastTimeUpdate >= 1000) {
     lastTimeUpdate = now;
     struct tm timeinfo;
@@ -569,26 +1314,41 @@ void loop() {
       curMinute = timeinfo.tm_min;
       curSecond = timeinfo.tm_sec;
       timeOK = true;
+      
+      if (!ntpSynced) {
+        ntpSynced = true;
+        logMessage("NTP time synchronized");
+      }
     } else {
       timeOK = false;
+      if (ntpSynced) {
+        ntpSynced = false;
+        logMessage("NTP sync lost", true);
+      }
     }
   }
 
-  // Программный ШИМ дисплея: в ночном режиме дисплей "мигает" с частотой 50 Гц,
-  // будучи включённым только половину времени — глаз воспринимает это как
-  // снижение яркости примерно вдвое, а не как настоящее выключение.
+  // PWM dimming
   if (now - lastPWMStep >= PWM_STEP_MS) {
     lastPWMStep = now;
     pwmStep = (pwmStep + 1) % PWM_STEPS;
 
     bool visible = true;
     if (nightMode) {
-      visible = (pwmStep < PWM_STEPS / 2); // 50% скважность
+      // Apply brightness in night mode
+      // Calculate visibility based on brightness and PWM step
+      int brightnessThreshold = (int)(brightness * PWM_STEPS / 100.0);
+      visible = (pwmStep < brightnessThreshold);
+    } else {
+      // Apply brightness in normal mode
+      int brightnessThreshold = (int)(brightness * PWM_STEPS / 100.0);
+      visible = (pwmStep < brightnessThreshold);
     }
 
     if (timeOK) {
       updateDisplay(curHour, curMinute, curSecond, visible);
     } else {
+      // Show dash pattern when no time
       updateDisplay(0, 0, 0, visible);
     }
   }
