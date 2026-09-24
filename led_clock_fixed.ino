@@ -1,6 +1,21 @@
 /*
   LED Clock  -  ESP8266 + 6x 74HC595 (6 digits, 7 segments + dp, active-low outputs)
-  Firmware 2.2.0
+  Firmware 2.3.0
+
+  Changes in 2.3.0 (on top of 2.2.0)
+  -----------------------------------
+  * Wi-Fi credentials (ssid/password/configured) now live in their own EEPROM
+    region with their own magic/CRC, separate from the rest of Config. Every
+    earlier version reset Wi-Fi whenever an unrelated setting was added to
+    Config and its magic got bumped, forcing a trip back through the AP to
+    re-enter the SSID/password. From this version on, only a change to the
+    WifiCreds struct itself (see near EEPROM_SIZE) can do that; Config can
+    keep growing without touching Wi-Fi. THIS ONE update still needs a manual
+    step: on first boot it copies whatever SSID/password is already sitting in
+    the old Config blob into the new protected region (logged as "Wi-Fi
+    credentials migrated..."), so if Wi-Fi was already configured before this
+    flash, it carries over automatically - only a device coming from a
+    reset/never-configured state needs the AP again.
 
   Changes in 2.2.0 (on top of 2.1.0)
   -----------------------------------
@@ -49,7 +64,7 @@
 #include <coredecls.h>
 #include <stddef.h>
 
-#define FIRMWARE_VERSION "2.2.0"
+#define FIRMWARE_VERSION "2.3.0"
 
 // ============================================================================
 //  Tunables
@@ -195,6 +210,59 @@ static void copyStr(char* dst, size_t cap, const String& s) {
 }
 
 // ============================================================================
+//  Wi-Fi credentials - stored in their own EEPROM region, independent of the
+//  rest of Config. Rationale: Config's magic/CRC gets bumped whenever the
+//  struct's layout changes (a new setting added, say), which invalidates the
+//  whole blob and resets everything in it, Wi-Fi included - meaning every
+//  firmware update that adds an unrelated setting would otherwise force the
+//  clock back into AP mode and require re-entering the SSID/password by hand.
+//  Keeping ssid/password/configured in their own block with their own magic
+//  means only a change to THIS struct can reset them; an unrelated Config
+//  change can't touch it. config.ssid/config.password/config.configured stay
+//  as before for the rest of the code to read - they're just no longer the
+//  thing that gets persisted on every save.
+// ============================================================================
+static const uint32_t WIFI_CREDS_MAGIC  = 0xC10CF1D0;
+static const size_t   WIFI_CREDS_OFFSET = 300;   // fixed; must stay >= sizeof(Config), see static_assert below
+
+struct WifiCreds {
+  uint32_t magic;
+  char     ssid[33];
+  char     password[65];
+  uint8_t  configured;
+  uint32_t crc;   // must stay last
+};
+static_assert(sizeof(Config) <= WIFI_CREDS_OFFSET,
+              "Config grew past WIFI_CREDS_OFFSET - move WIFI_CREDS_OFFSET further out");
+static_assert(WIFI_CREDS_OFFSET + sizeof(WifiCreds) <= EEPROM_SIZE,
+              "WifiCreds no longer fits before EEPROM_SIZE - raise EEPROM_SIZE");
+
+static uint32_t wifiCredsCrc(const WifiCreds& w) {
+  return crc32((const uint8_t*)&w, offsetof(WifiCreds, crc));
+}
+
+static bool loadWifiCreds(WifiCreds& w) {
+  EEPROM.get(WIFI_CREDS_OFFSET, w);
+  if (w.magic != WIFI_CREDS_MAGIC || w.crc != wifiCredsCrc(w)) return false;
+  w.ssid[sizeof(w.ssid) - 1] = '\0';
+  w.password[sizeof(w.password) - 1] = '\0';
+  return true;
+}
+
+// Persists the in-memory config.ssid / config.password / config.configured
+// into the protected region. Call this any time those three change.
+static void saveWifiCreds() {
+  WifiCreds w{};
+  w.magic = WIFI_CREDS_MAGIC;
+  copyStr(w.ssid, sizeof(w.ssid), String(config.ssid));
+  copyStr(w.password, sizeof(w.password), String(config.password));
+  w.configured = config.configured;
+  w.crc = wifiCredsCrc(w);
+  EEPROM.put(WIFI_CREDS_OFFSET, w);
+  EEPROM.commit();
+}
+
+// ============================================================================
 //  Logging (line-based ring buffer)
 // ============================================================================
 static const size_t LOG_SIZE = 2048;
@@ -296,6 +364,23 @@ static void loadConfig() {
   if (config.nightEndHour > 23 || config.nightEndMinute > 59)     { config.nightEndHour = 7;    config.nightEndMinute = 0; }
   if (strlen(config.apPassword) < 8) copyStr(config.apPassword, sizeof(config.apPassword), DEFAULT_AP_PASSWORD);
   if (config.ssid[0] == '\0') config.configured = 0;
+
+  // Wi-Fi credentials: always prefer the protected region over whatever is in
+  // the (possibly just-defaulted) main blob, since only the protected region
+  // is guaranteed to survive an unrelated Config layout change.
+  WifiCreds w;
+  if (loadWifiCreds(w)) {
+    copyStr(config.ssid, sizeof(config.ssid), String(w.ssid));
+    copyStr(config.password, sizeof(config.password), String(w.password));
+    config.configured = w.configured;
+    logMessage("Wi-Fi credentials restored from protected storage");
+  } else if (config.ssid[0] != '\0') {
+    // First boot on this scheme: the main blob still has valid credentials
+    // (it wasn't just reset) but the protected copy doesn't exist yet - adopt
+    // them so every later update stops resetting Wi-Fi.
+    saveWifiCreds();
+    logMessage("Wi-Fi credentials migrated to protected storage");
+  }
 }
 
 // ============================================================================
@@ -856,6 +941,8 @@ static bool processTelnetCommand(WiFiClient& out, String line) {
   return false;
 }
 
+static const char* TELNET_PROMPT = "clock> ";
+
 static void handleTelnet() {
   if (!telnetRunning) return;
 
@@ -878,6 +965,7 @@ static void handleTelnet() {
       sessions[slot].iac = 0;
       sessions[slot].active = true;
       nc.println("LED Clock " FIRMWARE_VERSION " - type 'help'");
+      nc.print(TELNET_PROMPT);
       logMessage(String("Telnet client connected from ") + nc.remoteIP().toString());
     }
   }
@@ -916,6 +1004,7 @@ static void handleTelnet() {
           logMessage("Telnet client exited");
           break;                 // s.client is gone, stop reading from this session
         }
+        s.client.print(TELNET_PROMPT);
       } else if (c >= 32 && c < 127 && s.len < sizeof(s.buf) - 1) {
         s.buf[s.len++] = (char)c;
       }
@@ -1465,6 +1554,7 @@ static void handleWiFi() {
   copyStr(config.password, sizeof(config.password), pass);
   config.configured = 1;
   saveConfigNow();
+  saveWifiCreds();
   logMessage("Wi-Fi credentials updated");
   sendOk();
   scheduleRestart(2500);
@@ -1476,6 +1566,7 @@ static void handleResetWiFi() {
   config.password[0] = '\0';
   config.configured = 0;
   saveConfigNow();
+  saveWifiCreds();
   logMessage("Wi-Fi configuration reset");
   sendOk();
   scheduleRestart(2000);
